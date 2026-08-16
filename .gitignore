@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+config.yaml
+rules.yaml
+preview*.csv
+rules.json
+.pytest_cache/

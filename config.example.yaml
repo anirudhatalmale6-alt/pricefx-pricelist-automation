@@ -1,0 +1,98 @@
+# ---------------------------------------------------------------------------
+# Pricefx price list automation -- configuration
+#
+# Copy to config.yaml and fill in. Credentials use ${ENV_VAR} so nothing secret
+# ever lands in this file (or in git).
+# ---------------------------------------------------------------------------
+
+tenant:
+  base_url: https://CLUSTER.pricefx.eu   # no trailing slash, no /pricefx
+  partition: YOUR_PARTITION
+  timeout: 60
+  page_size: 500          # rows per fetch request; the client pages past this
+  verify_tls: true
+
+auth:
+  # mode: token  -> POST user.login once, use the returned bearer token
+  # mode: basic  -> Authorization: Basic base64(partition/user:password)
+  mode: token
+  username: ${PFX_USER}
+  password: ${PFX_PASSWORD}
+  # token: ${PFX_TOKEN}   # set this instead of user/password if you issue tokens
+
+# Optional: override any endpoint path if your tenant's operation names differ.
+# Run `python3 -m pfx.cli probe --config config.yaml` to see what answers.
+# endpoints:
+#   pricelist_calculate: pricelistmanager.recalculate/{id}
+
+sku_field: sku            # the field on a source row that holds the SKU
+
+# --------------------------------------------------------------- data source
+source:
+  type: pricefx           # pricefx | csv
+  type_code: P            # P = Product master, PX = product extension
+  limit: null             # cap rows (handy while testing)
+  # Server-side pre-filter, so we do not drag the whole catalogue over the wire:
+  # filter_field: attribute1
+  # filter_value: ACTIVE
+  #
+  # For a CSV feed instead:
+  # type: csv
+  # path: ./data/products.csv
+
+# ------------------------------------------------------------------ segments
+# Each segment becomes its own price list. `filter` uses the same condition
+# syntax as the rules file. multi_match: first = a SKU lands on the first
+# matching segment only; all = it can land on several.
+#
+# ORDER MATTERS in `first` mode. Put the NARROW, overriding segments at the top:
+# a clearance SKU is usually also a retail SKU, so if RETAIL is listed first it
+# swallows every clearance item and the CLEARANCE list comes out empty. The run
+# summary prints per-segment row counts precisely so you catch that.
+multi_match: first
+
+segments:
+  - name: CLEARANCE           # narrowest first
+    label: Clearance
+    filter:
+      lifecycle: CLEARANCE
+
+  - name: WHOLESALE
+    label: Wholesale
+    filter:
+      all:
+        - channel: WHOLESALE
+        - lifecycle: { ne: DISCONTINUED }
+
+  - name: RETAIL              # broadest last -- catches whatever is left
+    label: Retail
+    filter:
+      channel: RETAIL
+    # rules_file: rules.retail.yaml     # optional per-segment override
+
+rules_file: rules.example.yaml
+
+# ---------------------------------------------------------------- price list
+price_list:
+  name_template: "PL_{segment}_{YYYYMM}"   # {segment} {label} {YYYY} {YYYYMM} {YYYYMMDD} {MM} {DD}
+  status: DRAFT
+  currency: EUR
+  on_exists: fail          # fail | reuse | suffix
+  calculate: true          # trigger the Pricefx calculation after loading items
+  submit_for_approval: false
+  # calculation_logic: PriceListLogic   # attach a PX/Groovy logic to the header
+  # pricing_parameters: {}
+  # fields: {}                          # any extra header fields your tenant needs
+
+# ----------------------------------------------------------------- line items
+line_item:
+  price_field: resultPrice   # where the calculated price is written
+  decimals: 2
+  chunk: 200                 # records per bulk add request
+  segment_field: attribute10 # stamp the segment name on each item (optional)
+  audit_field: attribute11   # store the calculation trail (optional, truncated)
+  audit_max_chars: 500
+  fields:
+    attribute1: category     # copy row.category -> item.attribute1
+    attribute2: brandTier
+    attribute3: "=AUTOGEN"   # a literal value (leading '=')

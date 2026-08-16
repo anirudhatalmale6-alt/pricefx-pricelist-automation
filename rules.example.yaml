@@ -1,0 +1,108 @@
+# ---------------------------------------------------------------------------
+# Pricing logic. This file is the thing your team will edit most, so it is
+# deliberately declarative -- no Python required to change a band or an uplift.
+#
+# Stages run in this order, top to bottom. Any stage you delete is skipped.
+#   base     -> pick the starting number
+#   tiers    -> band-based adjustment
+#   uplifts  -> if/then conditional adjustments
+#   bounds   -> floors / ceilings / margin protection
+#   rounding -> final price-point rounding
+#
+# CONDITION SYNTAX (used by `when:` here and by segment `filter:` in config)
+#   { field: "value" }                  equals, case-insensitive
+#   { field: { gt: 100 } }              gt gte lt lte
+#   { field: { in: [A, B] } }           in / not_in
+#   { field: { contains: "PRO" } }      contains / startswith / endswith / regex
+#   { field: { is_null: true } }        is_null / exists
+#   { all: [...] } { any: [...] } { not: {...} }
+#   Nested fields: "attributes.brandTier"
+# ---------------------------------------------------------------------------
+
+version: 1
+sku_field: sku
+pipeline: [base, tiers, uplifts, bounds, rounding]
+
+# ---------------------------------------------------------------------- base
+base:
+  field: costPrice
+  fallback_field: [stdCost, lastPrice]   # tried in order if the primary is empty
+  on_missing: skip                       # skip | error | zero
+
+# --------------------------------------------------------------------- tiers
+# Band-based markup. Bands are HALF-OPEN [min, max) so a value sitting exactly
+# on a boundary belongs to exactly one band -- no double-matching.
+tiers:
+  driver: base        # `base`, or any numeric field on the row (e.g. annualVolume)
+                      # NOTE: use `driver`, not `on`. YAML parses a bare `on:` key
+                      # as the boolean true. The loader rescues `on:` anyway, but
+                      # `driver:` avoids the trap entirely.
+  mode: percent       # percent | absolute | multiplier
+  bands:
+    - { name: micro,  max: 25,            value: 60 }
+    - { name: small,  min: 25,  max: 100, value: 45 }
+    - { name: mid,    min: 100, max: 500, value: 32 }
+    - { name: large,  min: 500,           value: 22 }
+  default: 35         # used when a row's driver matches no band
+
+# ------------------------------------------------------------------- uplifts
+# mode: accumulate  -> every matching rule applies, in file order
+# mode: first_match -> only the first matching rule applies
+uplifts:
+  mode: accumulate
+  rules:
+    - name: premium-brand
+      when: { brandTier: { in: [GOLD, PLATINUM] } }
+      then: { percent: 8 }
+
+    - name: private-label-discount
+      when: { brandTier: PRIVATE }
+      then: { percent: -6 }
+
+    - name: slow-moving-clearance
+      when:
+        all:
+          - lifecycle: CLEARANCE
+          - stockDays: { gt: 180 }
+      then: { percent: -30 }
+
+    - name: hazmat-handling-fee
+      when: { hazmat: { eq: "Y" } }
+      then: { absolute: 4.50 }
+
+    # A leading '@' reads the value off the row instead of using a literal.
+    # If the row has no contractPrice, the rule simply does not apply.
+    - name: contract-price-wins
+      when: { contractPrice: { exists: true } }
+      then: { set: "@contractPrice" }
+
+# -------------------------------------------------------------------- bounds
+bounds:
+  cost_field: costPrice
+  min_margin_percent: 15   # never sell below cost / (1 - 0.15)
+  # floor: 0.99
+  # ceiling: 9999
+  # floor_field: msrpFloor
+  # ceiling_field: msrp
+
+# ------------------------------------------------------------------ rounding
+rounding:
+  # Default: charm pricing -- round down to the whole unit, then force .99
+  default:
+    method: charm
+    increment: 1
+    ending: 0.99
+    direction: up          # up = 99.40 -> 99.99 ; down = 99.40 -> 98.99
+
+  overrides:
+    - name: pallet-nearest-5-cents
+      when: { uom: PALLET }
+      rule: { method: nearest, increment: 0.05 }
+
+    - name: clearance-price-points
+      when: { lifecycle: CLEARANCE }
+      rule: { method: endings, unit: 1, endings: ["0.00", "0.49", "0.99"], direction: down }
+
+    - name: high-value-whole-euros
+      when: { costPrice: { gte: 1000 } }
+      rule: { method: nearest, increment: 10 }
